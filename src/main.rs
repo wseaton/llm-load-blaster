@@ -4,10 +4,7 @@ use dotenv::dotenv;
 use std::env;
 use tracing::info;
 
-use load_blaster::{
-    benchmark::Benchmark,
-    data::download_dataset,
-};
+use load_blaster::{benchmark::Benchmark, data::download_dataset};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -49,8 +46,6 @@ struct Args {
     dataset_samples: usize,
 }
 
-
-
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
@@ -59,17 +54,11 @@ async fn main() -> Result<()> {
     info!("Starting load-blaster");
     let args = Args::parse();
 
-    let api_key = args
-        .api_key
-        .or_else(|| env::var("OPENAI_API_KEY").ok());
-    
-    let base_url = args
-        .base_url
-        .or_else(|| env::var("OPENAI_BASE_URL").ok());
-    
-    let model = args
-        .model
-        .or_else(|| env::var("MODEL_NAME").ok());
+    let api_key = args.api_key.or_else(|| env::var("OPENAI_API_KEY").ok());
+
+    let base_url = args.base_url.or_else(|| env::var("OPENAI_BASE_URL").ok());
+
+    let model = args.model.or_else(|| env::var("MODEL_NAME").ok());
 
     let prompts = if let Some(dataset) = args.dataset {
         download_dataset(&dataset, args.dataset_samples).await?
@@ -85,25 +74,25 @@ async fn main() -> Result<()> {
         .max_concurrent(args.max_concurrent)
         .total_requests(args.total_requests)
         .prompts(prompts);
-    
+
     let benchmark = if let Some(api_key) = api_key {
         benchmark.api_key(api_key)
     } else {
         benchmark
     };
-    
+
     let benchmark = if let Some(base_url) = base_url {
         benchmark.base_url(base_url)
     } else {
         benchmark
     };
-    
+
     let benchmark = if let Some(model) = model {
         benchmark.model(model)
     } else {
         benchmark
     };
-    
+
     let benchmark = benchmark.build()?;
     benchmark.run().await?;
 

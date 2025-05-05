@@ -1,6 +1,7 @@
 pub mod data {
     use std::fs::File;
 
+    use anyhow::Result;
     use hf_hub::{
         api::tokio::{Api, ApiRepo},
         Repo,
@@ -9,7 +10,6 @@ pub mod data {
         file::reader::{FileReader, SerializedFileReader},
         record::RecordReader,
     };
-    use anyhow::Result;
 
     use tracing::{error, info};
 
@@ -41,7 +41,8 @@ pub mod data {
                     "Write a short story about a robot learning to paint".to_string(),
                     "Explain quantum computing to a 10-year-old".to_string(),
                     "What are three ways to improve productivity?".to_string(),
-                    "Create a recipe for a dish using only ingredients that start with 'B'".to_string(),
+                    "Create a recipe for a dish using only ingredients that start with 'B'"
+                        .to_string(),
                     "Describe the process of photosynthesis".to_string(),
                 ];
                 Ok(fallbacks)
@@ -203,8 +204,6 @@ pub mod data {
 }
 
 pub mod benchmark {
-    use std::{sync::Arc, time::Duration};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use anyhow::{Context, Result};
     use async_openai::{
         config::OpenAIConfig,
@@ -213,6 +212,8 @@ pub mod benchmark {
     };
     use futures::StreamExt as FuturesStreamExt;
     use rand::seq::SliceRandom;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{sync::Arc, time::Duration};
     use tokio::sync::{Mutex, Semaphore};
     use tokio_stream::{self as stream, StreamExt as TokioStreamExt};
     use tracing::{error, info};
@@ -231,14 +232,16 @@ pub mod benchmark {
             if self.first_token_latency_ms.is_empty() {
                 return 0.0;
             }
-            self.first_token_latency_ms.iter().sum::<u64>() as f64 / self.first_token_latency_ms.len() as f64
+            self.first_token_latency_ms.iter().sum::<u64>() as f64
+                / self.first_token_latency_ms.len() as f64
         }
 
         pub fn average_inter_token_latency_ms(&self) -> f64 {
             if self.inter_token_latency_ms.is_empty() {
                 return 0.0;
             }
-            self.inter_token_latency_ms.iter().sum::<u64>() as f64 / self.inter_token_latency_ms.len() as f64
+            self.inter_token_latency_ms.iter().sum::<u64>() as f64
+                / self.inter_token_latency_ms.len() as f64
         }
 
         pub fn average_tokens_per_second(&self) -> f64 {
@@ -329,14 +332,15 @@ pub mod benchmark {
         }
 
         pub fn build(self) -> Result<Benchmark> {
-            let base_url = self.base_url
+            let base_url = self
+                .base_url
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            
-            let api_key = self.api_key
+
+            let api_key = self
+                .api_key
                 .context("API key not found. Set it in .env file or provide --api-key")?;
-            
-            let model = self.model
-                .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+
+            let model = self.model.unwrap_or_else(|| "gpt-3.5-turbo".to_string());
 
             Ok(Benchmark {
                 base_url,
@@ -353,7 +357,6 @@ pub mod benchmark {
             })
         }
     }
-
 
     impl Default for BenchmarkBuilder {
         fn default() -> Self {
@@ -386,10 +389,14 @@ pub mod benchmark {
             let throttled = TokioStreamExt::throttle(request_stream, interval);
             let total_sent_clone = Arc::clone(&self.total_sent);
             let throttled_stream = TokioStreamExt::take_while(throttled, move |_| {
-                self.total_requests == 0 || total_sent_clone.load(Ordering::Relaxed) < self.total_requests
+                self.total_requests == 0
+                    || total_sent_clone.load(Ordering::Relaxed) < self.total_requests
             });
 
-            info!("Sending {} requests per second to {}", self.rps, self.base_url);
+            info!(
+                "Sending {} requests per second to {}",
+                self.rps, self.base_url
+            );
             info!("Max concurrent requests: {}", self.max_concurrent);
 
             // Process the stream
@@ -402,19 +409,45 @@ pub mod benchmark {
             // Report metrics summary
             let metrics = self.metrics.lock().await;
             info!("Load test completed");
-            info!("Total requests sent: {}", self.total_sent.load(Ordering::Relaxed));
-            info!("Successful requests: {}", self.success_count.load(Ordering::Relaxed));
-            info!("Failed requests: {}", self.error_count.load(Ordering::Relaxed));
+            info!(
+                "Total requests sent: {}",
+                self.total_sent.load(Ordering::Relaxed)
+            );
+            info!(
+                "Successful requests: {}",
+                self.success_count.load(Ordering::Relaxed)
+            );
+            info!(
+                "Failed requests: {}",
+                self.error_count.load(Ordering::Relaxed)
+            );
             info!("Total tokens: {}", metrics.total_tokens);
-            info!("Average TTFT (time to first token): {:.2} ms", metrics.average_first_token_latency_ms());
-            info!("Average inter-token latency: {:.2} ms", metrics.average_inter_token_latency_ms());
-            info!("Average tokens per second: {:.2}", metrics.average_tokens_per_second());
-            info!("Average completion time: {:.2} ms", metrics.average_completion_time_ms());
+            info!(
+                "Average TTFT (time to first token): {:.2} ms",
+                metrics.average_first_token_latency_ms()
+            );
+            info!(
+                "Average inter-token latency: {:.2} ms",
+                metrics.average_inter_token_latency_ms()
+            );
+            info!(
+                "Average tokens per second: {:.2}",
+                metrics.average_tokens_per_second()
+            );
+            info!(
+                "Average completion time: {:.2} ms",
+                metrics.average_completion_time_ms()
+            );
 
             Ok(())
         }
 
-        async fn process_streaming_request(&self, req_num: u64, semaphore: Arc<Semaphore>, client: Client<OpenAIConfig>) {
+        async fn process_streaming_request(
+            &self,
+            req_num: u64,
+            semaphore: Arc<Semaphore>,
+            client: Client<OpenAIConfig>,
+        ) {
             let permit = match semaphore.acquire().await {
                 Ok(permit) => permit,
                 Err(e) => {
@@ -427,13 +460,14 @@ pub mod benchmark {
             if current_total % 100 == 0 {
                 info!(
                     "Sent {} requests (success: {}, error: {})",
-                    current_total, 
-                    self.success_count.load(Ordering::Relaxed), 
+                    current_total,
+                    self.success_count.load(Ordering::Relaxed),
                     self.error_count.load(Ordering::Relaxed)
                 );
             }
 
-            let prompt = self.prompts
+            let prompt = self
+                .prompts
                 .choose(&mut rand::thread_rng())
                 .unwrap_or(&"Hello!".to_string())
                 .clone();
@@ -473,25 +507,34 @@ pub mod benchmark {
                             Ok(response) => {
                                 for choice in &response.choices {
                                     if let Some(ref content_delta) = choice.delta.content {
-                                        if !content_delta.is_empty() && !content_delta.trim().is_empty() {
+                                        if !content_delta.is_empty()
+                                            && !content_delta.trim().is_empty()
+                                        {
                                             let now = std::time::Instant::now();
-                                            
+
                                             // Track token timing
                                             token_count += 1;
-                                            
+
                                             if !first_token_received {
                                                 first_token_received = true;
                                                 first_token_time = Some(now);
-                                                
+
                                                 // Time to first token
-                                                let ttft = now.duration_since(start_time).as_millis() as u64;
-                                                info!("Request {} - First token received in {} ms", req_num, ttft);
+                                                let ttft =
+                                                    now.duration_since(start_time).as_millis()
+                                                        as u64;
+                                                info!(
+                                                    "Request {} - First token received in {} ms",
+                                                    req_num, ttft
+                                                );
                                             } else {
                                                 // Inter-token latency
-                                                let inter_token_latency = now.duration_since(last_token_time).as_millis() as u64;
+                                                let inter_token_latency =
+                                                    now.duration_since(last_token_time).as_millis()
+                                                        as u64;
                                                 inter_token_latencies.push(inter_token_latency);
                                             }
-                                            
+
                                             last_token_time = now;
                                             last_content.push_str(content_delta);
                                         }
@@ -529,13 +572,16 @@ pub mod benchmark {
                         "Prompt: \"{}\", Response: \"{}\"",
                         prompt_snippet, response_snippet
                     );
-                    
+
                     // Update global metrics
                     if first_token_time.is_some() {
                         let mut metrics = self.metrics.lock().await;
                         metrics.total_tokens += token_count;
                         metrics.first_token_latency_ms.push(
-                            first_token_time.unwrap().duration_since(start_time).as_millis() as u64
+                            first_token_time
+                                .unwrap()
+                                .duration_since(start_time)
+                                .as_millis() as u64,
                         );
                         metrics.inter_token_latency_ms.extend(inter_token_latencies);
                         metrics.tokens_per_second.push(tokens_per_second);
@@ -552,6 +598,5 @@ pub mod benchmark {
 
             drop(permit);
         }
-
     }
 }
