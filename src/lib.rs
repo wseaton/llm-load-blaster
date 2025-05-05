@@ -213,9 +213,48 @@ pub mod benchmark {
     };
     use futures::StreamExt as FuturesStreamExt;
     use rand::seq::SliceRandom;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Mutex, Semaphore};
     use tokio_stream::{self as stream, StreamExt as TokioStreamExt};
-    use tracing::{error, info, warn};
+    use tracing::{error, info};
+
+    #[derive(Debug, Default, Clone)]
+    pub struct MetricsSnapshot {
+        pub total_tokens: usize,
+        pub first_token_latency_ms: Vec<u64>,
+        pub inter_token_latency_ms: Vec<u64>,
+        pub tokens_per_second: Vec<f64>,
+        pub total_time_ms: Vec<u64>,
+    }
+
+    impl MetricsSnapshot {
+        pub fn average_first_token_latency_ms(&self) -> f64 {
+            if self.first_token_latency_ms.is_empty() {
+                return 0.0;
+            }
+            self.first_token_latency_ms.iter().sum::<u64>() as f64 / self.first_token_latency_ms.len() as f64
+        }
+
+        pub fn average_inter_token_latency_ms(&self) -> f64 {
+            if self.inter_token_latency_ms.is_empty() {
+                return 0.0;
+            }
+            self.inter_token_latency_ms.iter().sum::<u64>() as f64 / self.inter_token_latency_ms.len() as f64
+        }
+
+        pub fn average_tokens_per_second(&self) -> f64 {
+            if self.tokens_per_second.is_empty() {
+                return 0.0;
+            }
+            self.tokens_per_second.iter().sum::<f64>() / self.tokens_per_second.len() as f64
+        }
+
+        pub fn average_completion_time_ms(&self) -> f64 {
+            if self.total_time_ms.is_empty() {
+                return 0.0;
+            }
+            self.total_time_ms.iter().sum::<u64>() as f64 / self.total_time_ms.len() as f64
+        }
+    }
 
     pub struct Benchmark {
         base_url: String,
@@ -228,6 +267,7 @@ pub mod benchmark {
         total_sent: Arc<AtomicU64>,
         success_count: Arc<AtomicU64>,
         error_count: Arc<AtomicU64>,
+        metrics: Arc<Mutex<MetricsSnapshot>>,
     }
 
     pub struct BenchmarkBuilder {
@@ -309,6 +349,7 @@ pub mod benchmark {
                 total_sent: Arc::new(AtomicU64::new(0)),
                 success_count: Arc::new(AtomicU64::new(0)),
                 error_count: Arc::new(AtomicU64::new(0)),
+                metrics: Arc::new(Mutex::new(MetricsSnapshot::default())),
             })
         }
     }
@@ -354,19 +395,26 @@ pub mod benchmark {
             // Process the stream
             let mut pinned_stream = Box::pin(throttled_stream);
             FuturesStreamExt::for_each_concurrent(&mut pinned_stream, None, |req_num| {
-                self.process_request(req_num, Arc::clone(&semaphore), client.clone())
+                self.process_streaming_request(req_num, Arc::clone(&semaphore), client.clone())
             })
             .await;
 
+            // Report metrics summary
+            let metrics = self.metrics.lock().await;
             info!("Load test completed");
             info!("Total requests sent: {}", self.total_sent.load(Ordering::Relaxed));
             info!("Successful requests: {}", self.success_count.load(Ordering::Relaxed));
             info!("Failed requests: {}", self.error_count.load(Ordering::Relaxed));
+            info!("Total tokens: {}", metrics.total_tokens);
+            info!("Average TTFT (time to first token): {:.2} ms", metrics.average_first_token_latency_ms());
+            info!("Average inter-token latency: {:.2} ms", metrics.average_inter_token_latency_ms());
+            info!("Average tokens per second: {:.2}", metrics.average_tokens_per_second());
+            info!("Average completion time: {:.2} ms", metrics.average_completion_time_ms());
 
             Ok(())
         }
 
-        async fn process_request(&self, req_num: u64, semaphore: Arc<Semaphore>, client: Client<OpenAIConfig>) {
+        async fn process_streaming_request(&self, req_num: u64, semaphore: Arc<Semaphore>, client: Client<OpenAIConfig>) {
             let permit = match semaphore.acquire().await {
                 Ok(permit) => permit,
                 Err(e) => {
@@ -374,8 +422,6 @@ pub mod benchmark {
                     return;
                 }
             };
-
-            let start = std::time::Instant::now();
 
             let current_total = self.total_sent.fetch_add(1, Ordering::Relaxed) + 1;
             if current_total % 100 == 0 {
@@ -392,6 +438,13 @@ pub mod benchmark {
                 .unwrap_or(&"Hello!".to_string())
                 .clone();
 
+            let prompt_snippet = if prompt.len() > 50 {
+                format!("{}...", &prompt[..47])
+            } else {
+                prompt.clone()
+            };
+
+            let start_time = std::time::Instant::now();
             let request = CreateChatCompletionRequest {
                 model: self.model.to_string(),
                 messages: vec![ChatCompletionRequestMessage {
@@ -400,48 +453,105 @@ pub mod benchmark {
                     name: None,
                     function_call: None,
                 }],
+                stream: Some(true),
                 ..Default::default()
             };
 
-            match client.chat().create(request).await {
-                Ok(response) => {
-                    let duration = start.elapsed();
-                    if let Some(choice) = response.choices.first() {
-                        info!("Request {} completed in {:?}", req_num, duration);
+            // Track streaming metrics
+            let mut token_count = 0;
+            let mut first_token_received = false;
+            let mut first_token_time = None;
+            let mut last_token_time = start_time;
+            let mut last_content = String::new();
+            let mut inter_token_latencies = Vec::new();
 
-                        let prompt_snippet = if prompt.len() > 50 {
-                            format!("{}...", &prompt[..47])
-                        } else {
-                            prompt.clone()
-                        };
-
-                        let response_snippet = if let Some(content) = &choice.message.content {
-                            if content.len() > 50 {
-                                format!("{}...", &content[..47])
-                            } else {
-                                content.clone()
+            // Create the streaming request
+            match client.chat().create_stream(request).await {
+                Ok(mut stream) => {
+                    while let Some(response) = FuturesStreamExt::next(&mut stream).await {
+                        match response {
+                            Ok(response) => {
+                                for choice in &response.choices {
+                                    if let Some(ref content_delta) = choice.delta.content {
+                                        if !content_delta.is_empty() && !content_delta.trim().is_empty() {
+                                            let now = std::time::Instant::now();
+                                            
+                                            // Track token timing
+                                            token_count += 1;
+                                            
+                                            if !first_token_received {
+                                                first_token_received = true;
+                                                first_token_time = Some(now);
+                                                
+                                                // Time to first token
+                                                let ttft = now.duration_since(start_time).as_millis() as u64;
+                                                info!("Request {} - First token received in {} ms", req_num, ttft);
+                                            } else {
+                                                // Inter-token latency
+                                                let inter_token_latency = now.duration_since(last_token_time).as_millis() as u64;
+                                                inter_token_latencies.push(inter_token_latency);
+                                            }
+                                            
+                                            last_token_time = now;
+                                            last_content.push_str(content_delta);
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            "No content".to_string()
-                        };
-
-                        info!(
-                            "Prompt: \"{}\", Response: \"{}\"",
-                            prompt_snippet, response_snippet
-                        );
-                        self.success_count.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        warn!("Request {} returned no choices", req_num);
-                        self.error_count.fetch_add(1, Ordering::Relaxed);
+                            Err(e) => {
+                                error!("Request {} streaming error: {}", req_num, e);
+                                self.error_count.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        }
                     }
+
+                    // Calculate final metrics
+                    let total_time = start_time.elapsed();
+                    let total_time_ms = total_time.as_millis() as u64;
+                    let tokens_per_second = if total_time.as_secs_f64() > 0.0 {
+                        token_count as f64 / total_time.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+
+                    let response_snippet = if last_content.len() > 50 {
+                        format!("{}...", &last_content[..47])
+                    } else {
+                        last_content.clone()
+                    };
+
+                    info!(
+                        "Request {} completed in {:?} - {} tokens, {:.2} tokens/sec",
+                        req_num, total_time, token_count, tokens_per_second
+                    );
+                    info!(
+                        "Prompt: \"{}\", Response: \"{}\"",
+                        prompt_snippet, response_snippet
+                    );
+                    
+                    // Update global metrics
+                    if first_token_time.is_some() {
+                        let mut metrics = self.metrics.lock().await;
+                        metrics.total_tokens += token_count;
+                        metrics.first_token_latency_ms.push(
+                            first_token_time.unwrap().duration_since(start_time).as_millis() as u64
+                        );
+                        metrics.inter_token_latency_ms.extend(inter_token_latencies);
+                        metrics.tokens_per_second.push(tokens_per_second);
+                        metrics.total_time_ms.push(total_time_ms);
+                    }
+
+                    self.success_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    error!("Request {} failed: {}", req_num, e);
+                    error!("Request {} failed to start streaming: {}", req_num, e);
                     self.error_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
             drop(permit);
         }
+
     }
 }
