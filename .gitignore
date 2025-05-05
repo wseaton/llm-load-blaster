@@ -1,0 +1,17 @@
+# Environment variables
+.env
+
+# Build artifacts
+/target/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+.claude/

@@ -1,0 +1,23 @@
+[package]
+name = "load-blaster"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.28", features = ["full"] }
+async-openai = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json"] }
+futures = "0.3"
+clap = { version = "4.3", features = ["derive"] }
+anyhow = "1.0"
+dotenv = "0.15"
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rand = "0.8"
+hf-hub = "0.4"
+parquet = { version = "55.0.0", features = ["serde"] }
+arrow = "55.0.0"
+parquet_derive = "55.0.0"
