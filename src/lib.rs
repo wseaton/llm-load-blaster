@@ -218,6 +218,21 @@ pub mod benchmark {
     use tokio_stream::{self as stream, StreamExt as TokioStreamExt};
     use tracing::{error, info};
 
+    /// Run mode for the benchmark
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum RunMode {
+        /// Dynamic mode - continuously sends requests at the specified RPS rate
+        Dynamic,
+        /// Static batch mode - sends a fixed batch of requests at once
+        StaticBatch,
+    }
+
+    impl Default for RunMode {
+        fn default() -> Self {
+            Self::Dynamic
+        }
+    }
+
     #[derive(Debug, Default, Clone)]
     pub struct MetricsSnapshot {
         pub total_tokens: usize,
@@ -271,6 +286,9 @@ pub mod benchmark {
         success_count: Arc<AtomicU64>,
         error_count: Arc<AtomicU64>,
         metrics: Arc<Mutex<MetricsSnapshot>>,
+        run_mode: RunMode,
+        batch_size: usize,
+        max_tokens: usize,
     }
 
     pub struct BenchmarkBuilder {
@@ -281,6 +299,9 @@ pub mod benchmark {
         max_concurrent: usize,
         total_requests: u64,
         prompts: Vec<String>,
+        run_mode: RunMode,
+        batch_size: usize,
+        max_tokens: usize,
     }
 
     impl BenchmarkBuilder {
@@ -293,6 +314,9 @@ pub mod benchmark {
                 max_concurrent: 50,
                 total_requests: 0,
                 prompts: vec!["Hello!".to_string()],
+                run_mode: RunMode::default(),
+                batch_size: 1,
+                max_tokens: 20,
             }
         }
 
@@ -331,6 +355,21 @@ pub mod benchmark {
             self
         }
 
+        pub fn run_mode(mut self, run_mode: RunMode) -> Self {
+            self.run_mode = run_mode;
+            self
+        }
+
+        pub fn batch_size(mut self, batch_size: usize) -> Self {
+            self.batch_size = batch_size;
+            self
+        }
+
+        pub fn max_tokens(mut self, max_tokens: usize) -> Self {
+            self.max_tokens = max_tokens;
+            self
+        }
+
         pub fn build(self) -> Result<Benchmark> {
             let base_url = self
                 .base_url
@@ -354,6 +393,9 @@ pub mod benchmark {
                 success_count: Arc::new(AtomicU64::new(0)),
                 error_count: Arc::new(AtomicU64::new(0)),
                 metrics: Arc::new(Mutex::new(MetricsSnapshot::default())),
+                run_mode: self.run_mode,
+                batch_size: self.batch_size,
+                max_tokens: self.max_tokens,
             })
         }
     }
@@ -369,11 +411,12 @@ pub mod benchmark {
             BenchmarkBuilder::new()
         }
 
-        pub async fn run(&self) -> Result<()> {
+        pub async fn run(self) -> Result<()> {
             info!("Starting load test");
             info!("Using API base URL: {}", self.base_url);
             info!("Using model: {}", self.model);
             info!("Loaded {} prompts", self.prompts.len());
+            info!("Run mode: {:?}", self.run_mode);
 
             let config = OpenAIConfig::new()
                 .with_api_base(&self.base_url)
@@ -384,27 +427,98 @@ pub mod benchmark {
             // limit the number of concurrent requests
             let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
 
-            let interval = Duration::from_secs_f64(1.0 / self.rps as f64);
-            let request_stream = stream::iter(0..self.total_requests.max(1));
-            let throttled = TokioStreamExt::throttle(request_stream, interval);
-            let total_sent_clone = Arc::clone(&self.total_sent);
-            let throttled_stream = TokioStreamExt::take_while(throttled, move |_| {
-                self.total_requests == 0
-                    || total_sent_clone.load(Ordering::Relaxed) < self.total_requests
-            });
+            match self.run_mode {
+                RunMode::Dynamic => {
+                    info!("Running in dynamic mode");
+                    info!(
+                        "Sending {} requests per second to {}",
+                        self.rps, self.base_url
+                    );
+                    info!("Max concurrent requests: {}", self.max_concurrent);
 
-            info!(
-                "Sending {} requests per second to {}",
-                self.rps, self.base_url
-            );
-            info!("Max concurrent requests: {}", self.max_concurrent);
+                    let interval = Duration::from_secs_f64(1.0 / self.rps as f64);
+                    let request_stream = stream::iter(0..self.total_requests.max(1));
+                    let throttled = TokioStreamExt::throttle(request_stream, interval);
+                    let total_sent_clone = Arc::clone(&self.total_sent);
+                    let throttled_stream = TokioStreamExt::take_while(throttled, move |_| {
+                        self.total_requests == 0
+                            || total_sent_clone.load(Ordering::Relaxed) < self.total_requests
+                    });
 
-            // Process the stream
-            let mut pinned_stream = Box::pin(throttled_stream);
-            FuturesStreamExt::for_each_concurrent(&mut pinned_stream, None, |req_num| {
-                self.process_streaming_request(req_num, Arc::clone(&semaphore), client.clone())
-            })
-            .await;
+                    // Process the stream
+                    let mut pinned_stream = Box::pin(throttled_stream);
+                    FuturesStreamExt::for_each_concurrent(&mut pinned_stream, None, |req_num| {
+                        self.process_streaming_request(req_num, Arc::clone(&semaphore), client.clone())
+                    })
+                    .await;
+                }
+                RunMode::StaticBatch => {
+                    info!("Running in static batch mode");
+                    info!("Batch size: {}", self.batch_size);
+                    info!("Max tokens: {}", self.max_tokens);
+
+                    let batch_requests = if self.total_requests > 0 {
+                        self.total_requests.min(self.prompts.len() as u64)
+                    } else {
+                        self.prompts.len() as u64
+                    };
+
+                    // Process in batches
+                    for i in (0..batch_requests).step_by(self.batch_size) {
+                        let end = (i + self.batch_size as u64).min(batch_requests);
+                        let batch_size = (end - i) as usize;
+                        
+                        info!("Processing batch {}-{}", i, end - 1);
+                        
+                        let prompts: Vec<_> = (i..end)
+                            .map(|idx| {
+                                let prompt_idx = (idx as usize) % self.prompts.len();
+                                self.prompts[prompt_idx].clone()
+                            })
+                            .collect();
+                        
+                        let mut futures = Vec::with_capacity(batch_size);
+                        for (local_idx, prompt) in prompts.into_iter().enumerate() {
+                            let req_num = i + local_idx as u64;
+                            let permit = semaphore.clone().acquire_owned().await.unwrap();
+                            
+                            // Track the total sent count
+                            self.total_sent.fetch_add(1, Ordering::Relaxed);
+                            
+                            // Clone the necessary data to move into the spawned task
+                            let model = self.model.clone();
+                            let metrics = self.metrics.clone();
+                            let success_count = self.success_count.clone();
+                            let error_count = self.error_count.clone();
+                            let max_tokens = self.max_tokens;
+                            let client_clone = client.clone();
+                            
+                            futures.push(tokio::spawn(async move {
+                                let result = process_batch_request(
+                                    req_num,
+                                    permit,
+                                    client_clone,
+                                    prompt,
+                                    model,
+                                    max_tokens,
+                                    metrics,
+                                    success_count,
+                                    error_count
+                                ).await;
+                                
+                                if let Err(e) = result {
+                                    error!("Request {} failed: {}", req_num, e);
+                                }
+                            }));
+                        }
+                        
+                        // Wait for all batch requests to complete
+                        for future in futures {
+                            let _ = future.await;
+                        }
+                    }
+                }
+            }
 
             // Report metrics summary
             let metrics = self.metrics.lock().await;
@@ -440,6 +554,18 @@ pub mod benchmark {
             );
 
             Ok(())
+        }
+
+        // Method is now a placeholder that delegates to the standalone function outside the impl block
+        async fn process_batch_request(
+            &self,
+            _req_num: u64, 
+            _permit: tokio::sync::OwnedSemaphorePermit, 
+            _client: Client<OpenAIConfig>, 
+            _prompt: String
+        ) -> Result<()> {
+            // This method is not used directly anymore - the standalone function below is used instead
+            unimplemented!("Use the standalone process_batch_request function")
         }
 
         async fn process_streaming_request(
@@ -598,5 +724,97 @@ pub mod benchmark {
 
             drop(permit);
         }
+    }
+
+    // Standalone function for processing batch requests
+    async fn process_batch_request(
+        req_num: u64, 
+        permit: tokio::sync::OwnedSemaphorePermit, 
+        client: Client<OpenAIConfig>, 
+        prompt: String,
+        model: String,
+        max_tokens: usize,
+        metrics: Arc<Mutex<MetricsSnapshot>>,
+        success_count: Arc<AtomicU64>,
+        error_count: Arc<AtomicU64>
+    ) -> Result<()> {
+        let prompt_snippet = if prompt.len() > 50 {
+            format!("{}...", &prompt[..47])
+        } else {
+            prompt.clone()
+        };
+
+        let start_time = std::time::Instant::now();
+        
+        info!("Request {} - Processing batch request", req_num);
+        
+        let request = CreateChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatCompletionRequestMessage {
+                role: Role::User,
+                content: Some(prompt.clone()),
+                name: None,
+                function_call: None,
+            }],
+            stream: Some(false),
+            max_tokens: Some(max_tokens.try_into().expect("Too small!")),
+            ..Default::default()
+        };
+        
+        match client.chat().create(request).await {
+            Ok(response) => {
+                let end_time = std::time::Instant::now();
+                let total_time = end_time.duration_since(start_time);
+                let total_time_ms = total_time.as_millis() as u64;
+                
+                // Extract response content
+                let choice = response.choices.first();
+                let content = choice
+                    .and_then(|c| c.message.content.clone())
+                    .unwrap_or_default();
+                
+                let token_count = choice.and_then(|c| c.message.content.as_ref().map(|s| s.len() / 4)).unwrap_or(0);
+                let tokens_per_second = if total_time.as_secs_f64() > 0.0 {
+                    token_count as f64 / total_time.as_secs_f64()
+                } else {
+                    0.0
+                };
+                
+                let response_snippet = if content.len() > 50 {
+                    format!("{}...", &content[..47])
+                } else {
+                    content.clone()
+                };
+                
+                info!(
+                    "Request {} completed in {:?} - ~{} tokens, {:.2} tokens/sec",
+                    req_num, total_time, token_count, tokens_per_second
+                );
+                info!(
+                    "Prompt: \"{}\", Response: \"{}\"",
+                    prompt_snippet, response_snippet
+                );
+                
+                // Update metrics
+                {
+                    let mut metrics_lock = metrics.lock().await;
+                    metrics_lock.total_tokens += token_count;
+                    // No first token latency for batch mode, using total time instead
+                    metrics_lock.first_token_latency_ms.push(total_time_ms);
+                    metrics_lock.tokens_per_second.push(tokens_per_second);
+                    metrics_lock.total_time_ms.push(total_time_ms);
+                }
+                
+                success_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                error!("Request {} failed: {}", req_num, e);
+                error_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        
+        // Drop the permit when done
+        drop(permit);
+        Ok(())
     }
 }

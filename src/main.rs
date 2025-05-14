@@ -4,7 +4,7 @@ use dotenv::dotenv;
 use std::env;
 use tracing::info;
 
-use load_blaster::{benchmark::Benchmark, data::download_dataset};
+use load_blaster::{benchmark::{Benchmark, RunMode}, data::download_dataset};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +44,18 @@ struct Args {
     /// Number of prompts to download from the dataset
     #[arg(long, default_value_t = 100)]
     dataset_samples: usize,
+    
+    /// Run mode: "dynamic" or "static_batch"
+    #[arg(long, default_value = "dynamic")]
+    run_mode: String,
+    
+    /// Batch size for static batch mode
+    #[arg(long, default_value_t = 1)]
+    batch_size: usize,
+    
+    /// Maximum number of tokens to generate per request
+    #[arg(long, default_value_t = 20)]
+    max_tokens: usize,
 }
 
 #[tokio::main]
@@ -69,11 +81,24 @@ async fn main() -> Result<()> {
         vec!["Hello!".to_string()]
     };
 
+    // Parse run mode
+    let run_mode = match args.run_mode.to_lowercase().as_str() {
+        "dynamic" => RunMode::Dynamic,
+        "static_batch" => RunMode::StaticBatch,
+        _ => {
+            info!("Invalid run mode: {}. Using default (dynamic)", args.run_mode);
+            RunMode::Dynamic
+        }
+    };
+
     let benchmark = Benchmark::builder()
         .rps(args.rps)
         .max_concurrent(args.max_concurrent)
         .total_requests(args.total_requests)
-        .prompts(prompts);
+        .prompts(prompts)
+        .run_mode(run_mode)
+        .batch_size(args.batch_size)
+        .max_tokens(args.max_tokens);
 
     let benchmark = if let Some(api_key) = api_key {
         benchmark.api_key(api_key)
